@@ -8,8 +8,12 @@ import (
 )
 
 const (
-	testHeartbeatTimeout = 50 * time.Millisecond
-	testElectionTimeout  = 200 * time.Millisecond
+	testHeartbeatInterval = 50 * time.Millisecond
+	testElectionTimeout   = 200 * time.Millisecond
+)
+
+const (
+	testListenerLoggerEnabled = false
 )
 
 func init() {
@@ -38,7 +42,7 @@ func setupLog(entries []*LogEntry) (*Log, string) {
 	f, _ := ioutil.TempFile("", "raft-log-")
 
 	for _, entry := range entries {
-		entry.encode(f)
+		entry.Encode(f)
 	}
 	err := f.Close()
 
@@ -47,7 +51,7 @@ func setupLog(entries []*LogEntry) (*Log, string) {
 	}
 
 	log := newLog()
-	log.ApplyFunc = func(c Command) (interface{}, error) {
+	log.ApplyFunc = func(e *LogEntry, c Command) (interface{}, error) {
 		return nil, nil
 	}
 	if err := log.open(f.Name()); err != nil {
@@ -66,6 +70,15 @@ func newTestServer(name string, transporter Transporter) Server {
 		panic(err.Error())
 	}
 	server, _ := NewServer(name, p, transporter, nil, nil, "")
+	if testListenerLoggerEnabled {
+		fn := func(e Event) {
+			server := e.Source().(Server)
+			warnf("[%s] %s %v -> %v\n", server.Name(), e.Type(), e.PrevValue(), e.Value())
+		}
+		server.AddEventListener(StateChangeEventType, fn)
+		server.AddEventListener(LeaderChangeEventType, fn)
+		server.AddEventListener(TermChangeEventType, fn)
+	}
 	return server
 }
 
@@ -82,7 +95,7 @@ func newTestServerWithLog(name string, transporter Transporter, entries []*LogEn
 	}
 
 	for _, entry := range entries {
-		entry.encode(f)
+		entry.Encode(f)
 	}
 	f.Close()
 	return server
@@ -90,7 +103,7 @@ func newTestServerWithLog(name string, transporter Transporter, entries []*LogEn
 
 func newTestCluster(names []string, transporter Transporter, lookup map[string]Server) []Server {
 	servers := []Server{}
-	e0, _ := newLogEntry(newLog(), 1, 1, &testCommand1{Val: "foo", I: 20})
+	e0, _ := newLogEntry(newLog(), nil, 1, 1, &testCommand1{Val: "foo", I: 20})
 
 	for _, name := range names {
 		if lookup[name] != nil {
@@ -102,7 +115,7 @@ func newTestCluster(names []string, transporter Transporter, lookup map[string]S
 		lookup[name] = server
 	}
 	for _, server := range servers {
-		server.SetHeartbeatTimeout(testHeartbeatTimeout)
+		server.SetHeartbeatInterval(testHeartbeatInterval)
 		server.Start()
 		for _, peer := range servers {
 			server.AddPeer(peer.Name(), "")

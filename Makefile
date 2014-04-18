@@ -1,13 +1,17 @@
-all: test
+COVERPROFILE=cover.out
 
-coverage:
-	gocov test github.com/coreos/go-raft | gocov-html > coverage.html
-	open coverage.html
+default: test
+
+cover:
+	go test -coverprofile=$(COVERPROFILE) .
+	go tool cover -html=$(COVERPROFILE)
+	rm $(COVERPROFILE)
 
 dependencies:
 	go get -d .
 
 test:
+	go test -i ./...
 	go test -v ./...
 
 .PHONY: coverage dependencies test

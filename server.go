@@ -21,6 +21,7 @@ import (
 
 const (
 	Stopped      = "stopped"
+	Initialized  = "initialized"
 	Follower     = "follower"
 	Candidate    = "candidate"
 	Leader       = "leader"
@@ -33,11 +34,17 @@ const (
 )
 
 const (
-	DefaultHeartbeatTimeout = 50 * time.Millisecond
-	DefaultElectionTimeout  = 150 * time.Millisecond
+	// DefaultHeartbeatInterval is the interval that the leader will send
+	// AppendEntriesRequests to followers to maintain leadership.
+	DefaultHeartbeatInterval = 50 * time.Millisecond
+
+	DefaultElectionTimeout = 150 * time.Millisecond
 )
 
-var stopValue interface{}
+// ElectionTimeoutThresholdPercent specifies the threshold at which the server
+// will dispatch warning events that the heartbeat RTT is too close to the
+// election timeout.
+const ElectionTimeoutThresholdPercent = 0.8
 
 //------------------------------------------------------------------------------
 //
@@ -77,8 +84,8 @@ type Server interface {
 	GetState() string
 	ElectionTimeout() time.Duration
 	SetElectionTimeout(duration time.Duration)
-	HeartbeatTimeout() time.Duration
-	SetHeartbeatTimeout(duration time.Duration)
+	HeartbeatInterval() time.Duration
+	SetHeartbeatInterval(duration time.Duration)
 	Transporter() Transporter
 	SetTransporter(t Transporter)
 	AppendEntries(req *AppendEntriesRequest) *AppendEntriesResponse
@@ -88,15 +95,20 @@ type Server interface {
 	AddPeer(name string, connectiongString string) error
 	RemovePeer(name string) error
 	Peers() map[string]*Peer
+	Init() error
 	Start() error
 	Stop()
 	Running() bool
 	Do(command Command) (interface{}, error)
 	TakeSnapshot() error
 	LoadSnapshot() error
+	AddEventListener(string, EventListener)
+	FlushCommitIndex()
 }
 
 type server struct {
+	*eventDispatcher
+
 	name        string
 	path        string
 	state       string
@@ -111,20 +123,27 @@ type server struct {
 	mutex      sync.RWMutex
 	syncedPeer map[string]bool
 
-	c                chan *event
-	electionTimeout  time.Duration
-	heartbeatTimeout time.Duration
+	stopped           chan chan bool
+	c                 chan *ev
+	electionTimeout   time.Duration
+	heartbeatInterval time.Duration
 
-	currentSnapshot         *Snapshot
-	lastSnapshot            *Snapshot
+	snapshot *Snapshot
+
+	// PendingSnapshot is an unfinished snapshot.
+	// After the pendingSnapshot is saved to disk,
+	// it will be set to snapshot and also will be
+	// set to nil.
+	pendingSnapshot *Snapshot
+
 	stateMachine            StateMachine
 	maxLogEntriesPerRequest uint64
 
 	connectionString string
 }
 
-// An event to be processed by the server's event loop.
-type event struct {
+// An internal event to be processed by the server's event loop.
+type ev struct {
 	target      interface{}
 	returnValue interface{}
 	c           chan error
@@ -136,8 +155,12 @@ type event struct {
 //
 //------------------------------------------------------------------------------
 
-// Creates a new server with a log at the given path.
-func NewServer(name string, path string, transporter Transporter, stateMachine StateMachine, context interface{}, connectionString string) (Server, error) {
+// Creates a new server with a log at the given path. transporter must
+// not be nil. stateMachine can be nil if snapshotting and log
+// compaction is to be disabled. context can be anything (including nil)
+// and is not used by the raft package except returned by
+// Server.Context(). connectionString can be anything.
+func NewServer(name string, path string, transporter Transporter, stateMachine StateMachine, ctx interface{}, connectionString string) (Server, error) {
 	if name == "" {
 		return nil, errors.New("raft.Server: Name cannot be blank")
 	}
@@ -150,21 +173,38 @@ func NewServer(name string, path string, transporter Transporter, stateMachine S
 		path:                    path,
 		transporter:             transporter,
 		stateMachine:            stateMachine,
-		context:                 context,
+		context:                 ctx,
 		state:                   Stopped,
 		peers:                   make(map[string]*Peer),
 		log:                     newLog(),
-		c:                       make(chan *event, 256),
+		stopped:                 make(chan chan bool),
+		c:                       make(chan *ev, 256),
 		electionTimeout:         DefaultElectionTimeout,
-		heartbeatTimeout:        DefaultHeartbeatTimeout,
+		heartbeatInterval:       DefaultHeartbeatInterval,
 		maxLogEntriesPerRequest: MaxLogEntriesPerRequest,
 		connectionString:        connectionString,
 	}
+	s.eventDispatcher = newEventDispatcher(s)
 
 	// Setup apply function.
-	s.log.ApplyFunc = func(c Command) (interface{}, error) {
-		result, err := c.Apply(s)
-		return result, err
+	s.log.ApplyFunc = func(e *LogEntry, c Command) (interface{}, error) {
+		// Dispatch commit event.
+		s.DispatchEvent(newEvent(CommitEventType, e, nil))
+
+		// Apply command to the state machine.
+		switch c := c.(type) {
+		case CommandApply:
+			return c.Apply(&context{
+				server:       s,
+				currentTerm:  s.currentTerm,
+				currentIndex: s.log.internalCurrentIndex(),
+				commitIndex:  s.log.commitIndex,
+			})
+		case deprecatedCommandApply:
+			return c.Apply(s)
+		default:
+			return nil, fmt.Errorf("Command does not implement Apply()")
+		}
 	}
 
 	return s, nil
@@ -246,19 +286,37 @@ func (s *server) State() string {
 func (s *server) setState(state string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	// Temporarily store previous values.
+	prevState := s.state
+	prevLeader := s.leader
+
+	// Update state and leader.
 	s.state = state
 	if state == Leader {
 		s.leader = s.Name()
+		s.syncedPeer = make(map[string]bool)
+	}
+
+	// Dispatch state and leader change events.
+	s.DispatchEvent(newEvent(StateChangeEventType, s.state, prevState))
+
+	if prevLeader != s.leader {
+		s.DispatchEvent(newEvent(LeaderChangeEventType, s.leader, prevLeader))
 	}
 }
 
 // Retrieves the current term of the server.
 func (s *server) Term() uint64 {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 	return s.currentTerm
 }
 
 // Retrieves the current commit index of the server.
 func (s *server) CommitIndex() uint64 {
+	s.log.mutex.RLock()
+	defer s.log.mutex.RUnlock()
 	return s.log.commitIndex
 }
 
@@ -333,20 +391,20 @@ func (s *server) SetElectionTimeout(duration time.Duration) {
 //--------------------------------------
 
 // Retrieves the heartbeat timeout.
-func (s *server) HeartbeatTimeout() time.Duration {
+func (s *server) HeartbeatInterval() time.Duration {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
-	return s.heartbeatTimeout
+	return s.heartbeatInterval
 }
 
 // Sets the heartbeat timeout.
-func (s *server) SetHeartbeatTimeout(duration time.Duration) {
+func (s *server) SetHeartbeatInterval(duration time.Duration) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	s.heartbeatTimeout = duration
+	s.heartbeatInterval = duration
 	for _, peer := range s.peers {
-		peer.setHeartbeatTimeout(duration)
+		peer.setHeartbeatInterval(duration)
 	}
 }
 
@@ -367,34 +425,20 @@ func init() {
 	RegisterCommand(&DefaultLeaveCommand{})
 }
 
-// Start as follow
+// Start the raft server
 // If log entries exist then allow promotion to candidate if no AEs received.
 // If no log entries exist then wait for AEs from another node.
 // If no log entries exist and a self-join command is issued then
 // immediately become leader and commit entry.
-
 func (s *server) Start() error {
 	// Exit if the server is already running.
-	if s.state != Stopped {
-		return errors.New("raft.Server: Server already running")
+	if s.Running() {
+		return fmt.Errorf("raft.Server: Server already running[%v]", s.state)
 	}
 
-	// Create snapshot directory if not exist
-	os.Mkdir(path.Join(s.path, "snapshot"), 0700)
-
-	if err := s.readConf(); err != nil {
-		s.debugln("raft: Conf file error: ", err)
-		return fmt.Errorf("raft: Initialization error: %s", err)
+	if err := s.Init(); err != nil {
+		return err
 	}
-
-	// Initialize the log and load it up.
-	if err := s.log.open(s.LogPath()); err != nil {
-		s.debugln("raft: Log error: ", err)
-		return fmt.Errorf("raft: Initialization error: %s", err)
-	}
-
-	// Update the term to the last term in the log.
-	_, s.currentTerm = s.log.lastInfo()
 
 	s.setState(Follower)
 
@@ -418,11 +462,51 @@ func (s *server) Start() error {
 	return nil
 }
 
+// Init initializes the raft server
+func (s *server) Init() error {
+	if s.Running() {
+		return fmt.Errorf("raft.Server: Server already running[%v]", s.state)
+	}
+
+	// server has been initialized or server was stopped after initialized
+	if s.state == Initialized || !s.log.isEmpty() {
+		s.state = Initialized
+		return nil
+	}
+
+	// Create snapshot directory if it does not exist
+	err := os.Mkdir(path.Join(s.path, "snapshot"), 0700)
+	if err != nil && !os.IsExist(err) {
+		s.debugln("raft: Snapshot dir error: ", err)
+		return fmt.Errorf("raft: Initialization error: %s", err)
+	}
+
+	if err := s.readConf(); err != nil {
+		s.debugln("raft: Conf file error: ", err)
+		return fmt.Errorf("raft: Initialization error: %s", err)
+	}
+
+	// Initialize the log and load it up.
+	if err := s.log.open(s.LogPath()); err != nil {
+		s.debugln("raft: Log error: ", err)
+		return fmt.Errorf("raft: Initialization error: %s", err)
+	}
+
+	// Update the term to the last term in the log.
+	_, s.currentTerm = s.log.lastInfo()
+
+	s.state = Initialized
+	return nil
+}
+
 // Shuts down the server.
 func (s *server) Stop() {
-	s.send(&stopValue)
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	stop := make(chan bool)
+	s.stopped <- stop
+	s.state = Stopped
+
+	// make sure the server has stopped before we close the log
+	<-stop
 	s.log.close()
 }
 
@@ -430,35 +514,50 @@ func (s *server) Stop() {
 func (s *server) Running() bool {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
-	return s.state != Stopped
+	return (s.state != Stopped && s.state != Initialized)
 }
 
 //--------------------------------------
 // Term
 //--------------------------------------
 
-// Sets the current term for the server. This is only used when an external
-// current term is found.
-func (s *server) setCurrentTerm(term uint64, leaderName string, append bool) {
+// updates the current term for the server. This is only used when a larger
+// external term is found.
+func (s *server) updateCurrentTerm(term uint64, leaderName string) {
+	_assert(term > s.currentTerm,
+		"upadteCurrentTerm: update is called when term is not larger than currentTerm")
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+	// Store previous values temporarily.
+	prevTerm := s.currentTerm
+	prevLeader := s.leader
 
+	// set currentTerm = T, convert to follower (§5.1)
+	// stop heartbeats before step-down
+	if s.state == Leader {
+		s.mutex.Unlock()
+		for _, peer := range s.peers {
+			peer.stopHeartbeat(false)
+		}
+		s.mutex.Lock()
+	}
 	// update the term and clear vote for
-	if term > s.currentTerm {
-		s.state = Follower
-		s.currentTerm = term
-		s.leader = leaderName
-		s.votedFor = ""
-		return
+	if s.state != Follower {
+		s.mutex.Unlock()
+		s.setState(Follower)
+		s.mutex.Lock()
 	}
+	s.currentTerm = term
+	s.leader = leaderName
+	s.votedFor = ""
 
-	// discover new leader when candidate
-	// save leader name when follower
-	if term == s.currentTerm && s.state != Leader && append {
-		s.state = Follower
-		s.leader = leaderName
+	// Dispatch change events.
+	s.DispatchEvent(newEvent(TermChangeEventType, s.currentTerm, prevTerm))
+
+	if prevLeader != s.leader {
+		s.DispatchEvent(newEvent(LeaderChangeEventType, s.leader, prevLeader))
 	}
-
 }
 
 //--------------------------------------
@@ -481,25 +580,19 @@ func (s *server) setCurrentTerm(term uint64, leaderName string, append bool) {
 func (s *server) loop() {
 	defer s.debugln("server.loop.end")
 
-	for {
+	for s.state != Stopped {
 		state := s.State()
 
 		s.debugln("server.loop.run ", state)
 		switch state {
 		case Follower:
 			s.followerLoop()
-
 		case Candidate:
 			s.candidateLoop()
-
 		case Leader:
 			s.leaderLoop()
-
 		case Snapshotting:
 			s.snapshotLoop()
-
-		case Stopped:
-			return
 		}
 	}
 }
@@ -507,15 +600,26 @@ func (s *server) loop() {
 // Sends an event to the event loop to be processed. The function will wait
 // until the event is actually processed before returning.
 func (s *server) send(value interface{}) (interface{}, error) {
-	event := s.sendAsync(value)
+	event := &ev{target: value, c: make(chan error, 1)}
+	s.c <- event
 	err := <-event.c
 	return event.returnValue, err
 }
 
-func (s *server) sendAsync(value interface{}) *event {
-	event := &event{target: value, c: make(chan error, 1)}
-	s.c <- event
-	return event
+func (s *server) sendAsync(value interface{}) {
+	event := &ev{target: value, c: make(chan error, 1)}
+	// try a non-blocking send first
+	// in most cases, this should not be blocking
+	// avoid create unnecessary go routines
+	select {
+	case s.c <- event:
+		return
+	default:
+	}
+
+	go func() {
+		s.c <- event
+	}()
 }
 
 // The event loop that is run when the server is in a Follower state.
@@ -524,45 +628,49 @@ func (s *server) sendAsync(value interface{}) *event {
 //   1.Receiving valid AppendEntries RPC, or
 //   2.Granting vote to candidate
 func (s *server) followerLoop() {
-
-	s.setState(Follower)
+	since := time.Now()
+	electionTimeout := s.ElectionTimeout()
 	timeoutChan := afterBetween(s.ElectionTimeout(), s.ElectionTimeout()*2)
 
-	for {
+	for s.State() == Follower {
 		var err error
 		update := false
 		select {
+		case stop := <-s.stopped:
+			s.setState(Stopped)
+			stop <- true
+			return
+
 		case e := <-s.c:
-			if e.target == &stopValue {
-				s.setState(Stopped)
-			} else {
-				switch req := e.target.(type) {
-				case JoinCommand:
-					//If no log entries exist and a self-join command is issued
-					//then immediately become leader and commit entry.
-					if s.log.currentIndex() == 0 && req.NodeName() == s.Name() {
-						s.debugln("selfjoin and promote to leader")
-						s.setState(Leader)
-						s.processCommand(req, e)
-					} else {
-						err = NotLeaderError
-					}
-				case *AppendEntriesRequest:
-					e.returnValue, update = s.processAppendEntriesRequest(req)
-				case *RequestVoteRequest:
-					e.returnValue, update = s.processRequestVoteRequest(req)
-				case *SnapshotRequest:
-					e.returnValue = s.processSnapshotRequest(req)
-				default:
+			switch req := e.target.(type) {
+			case JoinCommand:
+				//If no log entries exist and a self-join command is issued
+				//then immediately become leader and commit entry.
+				if s.log.currentIndex() == 0 && req.NodeName() == s.Name() {
+					s.debugln("selfjoin and promote to leader")
+					s.setState(Leader)
+					s.processCommand(req, e)
+				} else {
 					err = NotLeaderError
 				}
+			case *AppendEntriesRequest:
+				// If heartbeats get too close to the election timeout then send an event.
+				elapsedTime := time.Now().Sub(since)
+				if elapsedTime > time.Duration(float64(electionTimeout)*ElectionTimeoutThresholdPercent) {
+					s.DispatchEvent(newEvent(ElectionTimeoutThresholdEventType, elapsedTime, nil))
+				}
+				e.returnValue, update = s.processAppendEntriesRequest(req)
+			case *RequestVoteRequest:
+				e.returnValue, update = s.processRequestVoteRequest(req)
+			case *SnapshotRequest:
+				e.returnValue = s.processSnapshotRequest(req)
+			default:
+				err = NotLeaderError
 			}
-
 			// Callback to event.
 			e.c <- err
 
 		case <-timeoutChan:
-
 			// only allow synced follower to promote to candidate
 			if s.promotable() {
 				s.setState(Candidate)
@@ -575,103 +683,92 @@ func (s *server) followerLoop() {
 		//   1.Receiving valid AppendEntries RPC, or
 		//   2.Granting vote to candidate
 		if update {
+			since = time.Now()
 			timeoutChan = afterBetween(s.ElectionTimeout(), s.ElectionTimeout()*2)
-		}
-
-		// Exit loop on state change.
-		if s.State() != Follower {
-			break
 		}
 	}
 }
 
 // The event loop that is run when the server is in a Candidate state.
 func (s *server) candidateLoop() {
-	lastLogIndex, lastLogTerm := s.log.lastInfo()
+	// Clear leader value.
+	prevLeader := s.leader
 	s.leader = ""
+	if prevLeader != s.leader {
+		s.DispatchEvent(newEvent(LeaderChangeEventType, s.leader, prevLeader))
+	}
 
-	for {
-		// Increment current term, vote for self.
-		s.currentTerm++
-		s.votedFor = s.name
+	lastLogIndex, lastLogTerm := s.log.lastInfo()
+	doVote := true
+	votesGranted := 0
+	var timeoutChan <-chan time.Time
+	var respChan chan *RequestVoteResponse
 
-		// Send RequestVote RPCs to all other servers.
-		respChan := make(chan *RequestVoteResponse, len(s.peers))
-		for _, peer := range s.peers {
-			go peer.sendVoteRequest(newRequestVoteRequest(s.currentTerm, s.name, lastLogIndex, lastLogTerm), respChan)
-		}
+	for s.State() == Candidate {
+		if doVote {
+			// Increment current term, vote for self.
+			s.currentTerm++
+			s.votedFor = s.name
 
-		// Wait for either:
-		//   * Votes received from majority of servers: become leader
-		//   * AppendEntries RPC received from new leader: step down.
-		//   * Election timeout elapses without election resolution: increment term, start new election
-		//   * Discover higher term: step down (§5.1)
-		votesGranted := 1
-		timeoutChan := afterBetween(s.ElectionTimeout(), s.ElectionTimeout()*2)
-		timeout := false
-
-		for {
-			// If we received enough votes then stop waiting for more votes.
-			s.debugln("server.candidate.votes: ", votesGranted, " quorum:", s.QuorumSize())
-			if votesGranted >= s.QuorumSize() {
-				s.setState(Leader)
-				break
+			// Send RequestVote RPCs to all other servers.
+			respChan = make(chan *RequestVoteResponse, len(s.peers))
+			for _, peer := range s.peers {
+				go peer.sendVoteRequest(newRequestVoteRequest(s.currentTerm, s.name, lastLogIndex, lastLogTerm), respChan)
 			}
 
-			// Collect votes from peers.
-			select {
-			case resp := <-respChan:
-				if resp.VoteGranted {
-					s.debugln("server.candidate.vote.granted: ", votesGranted)
-					votesGranted++
-				} else if resp.Term > s.currentTerm {
-					s.debugln("server.candidate.vote.failed")
-					s.setCurrentTerm(resp.Term, "", false)
-				} else {
-					s.debugln("server.candidate.vote: denied")
-				}
-
-			case e := <-s.c:
-				var err error
-				if e.target == &stopValue {
-					s.setState(Stopped)
-				} else {
-					switch req := e.target.(type) {
-					case Command:
-						err = NotLeaderError
-					case *AppendEntriesRequest:
-						e.returnValue, _ = s.processAppendEntriesRequest(req)
-					case *RequestVoteRequest:
-						e.returnValue, _ = s.processRequestVoteRequest(req)
-					}
-				}
-				// Callback to event.
-				e.c <- err
-
-			case <-timeoutChan:
-				timeout = true
-			}
-
-			// both process AER and RVR can make the server to follower
-			// also break when timeout happens
-			if s.State() != Candidate || timeout {
-				break
-			}
+			// Wait for either:
+			//   * Votes received from majority of servers: become leader
+			//   * AppendEntries RPC received from new leader: step down.
+			//   * Election timeout elapses without election resolution: increment term, start new election
+			//   * Discover higher term: step down (§5.1)
+			votesGranted = 1
+			timeoutChan = afterBetween(s.ElectionTimeout(), s.ElectionTimeout()*2)
+			doVote = false
 		}
 
-		// break when we are not candidate
-		if s.State() != Candidate {
-			break
+		// If we received enough votes then stop waiting for more votes.
+		// And return from the candidate loop
+		if votesGranted == s.QuorumSize() {
+			s.debugln("server.candidate.recv.enough.votes")
+			s.setState(Leader)
+			return
 		}
 
-		// continue when timeout happened
+		// Collect votes from peers.
+		select {
+		case stop := <-s.stopped:
+			s.setState(Stopped)
+			stop <- true
+			return
+
+		case resp := <-respChan:
+			if success := s.processVoteResponse(resp); success {
+				s.debugln("server.candidate.vote.granted: ", votesGranted)
+				votesGranted++
+			}
+
+		case e := <-s.c:
+			var err error
+			switch req := e.target.(type) {
+			case Command:
+				err = NotLeaderError
+			case *AppendEntriesRequest:
+				e.returnValue, _ = s.processAppendEntriesRequest(req)
+			case *RequestVoteRequest:
+				e.returnValue, _ = s.processRequestVoteRequest(req)
+			}
+
+			// Callback to event.
+			e.c <- err
+
+		case <-timeoutChan:
+			doVote = true
+		}
 	}
 }
 
 // The event loop that is run when the server is in a Leader state.
 func (s *server) leaderLoop() {
-	s.setState(Leader)
-	s.syncedPeer = make(map[string]bool)
 	logIndex, _ := s.log.lastInfo()
 
 	// Update the peers prevLogIndex to leader's lastLogIndex and start heartbeat.
@@ -681,57 +778,56 @@ func (s *server) leaderLoop() {
 		peer.startHeartbeat()
 	}
 
+	// Commit a NOP after the server becomes leader. From the Raft paper:
+	// "Upon election: send initial empty AppendEntries RPCs (heartbeat) to
+	// each server; repeat during idle periods to prevent election timeouts
+	// (§5.2)". The heartbeats started above do the "idle" period work.
 	go s.Do(NOPCommand{})
 
 	// Begin to collect response from followers
-	for {
+	for s.State() == Leader {
 		var err error
 		select {
+		case stop := <-s.stopped:
+			// Stop all peers before stop
+			for _, peer := range s.peers {
+				peer.stopHeartbeat(false)
+			}
+			s.setState(Stopped)
+			stop <- true
+			return
+
 		case e := <-s.c:
-			if e.target == &stopValue {
-				s.setState(Stopped)
-			} else {
-				switch req := e.target.(type) {
-				case Command:
-					s.processCommand(req, e)
-					continue
-				case *AppendEntriesRequest:
-					e.returnValue, _ = s.processAppendEntriesRequest(req)
-				case *AppendEntriesResponse:
-					s.processAppendEntriesResponse(req)
-				case *RequestVoteRequest:
-					e.returnValue, _ = s.processRequestVoteRequest(req)
-				}
+			switch req := e.target.(type) {
+			case Command:
+				s.processCommand(req, e)
+				continue
+			case *AppendEntriesRequest:
+				e.returnValue, _ = s.processAppendEntriesRequest(req)
+			case *AppendEntriesResponse:
+				s.processAppendEntriesResponse(req)
+			case *RequestVoteRequest:
+				e.returnValue, _ = s.processRequestVoteRequest(req)
 			}
 
 			// Callback to event.
 			e.c <- err
 		}
-
-		// Exit loop on state change.
-		if s.State() != Leader {
-			break
-		}
 	}
 
-	// Stop all peers.
-	for _, peer := range s.peers {
-		peer.stopHeartbeat(false)
-	}
 	s.syncedPeer = nil
 }
 
 func (s *server) snapshotLoop() {
-	s.setState(Snapshotting)
-
-	for {
+	for s.State() == Snapshotting {
 		var err error
-
-		e := <-s.c
-
-		if e.target == &stopValue {
+		select {
+		case stop := <-s.stopped:
 			s.setState(Stopped)
-		} else {
+			stop <- true
+			return
+
+		case e := <-s.c:
 			switch req := e.target.(type) {
 			case Command:
 				err = NotLeaderError
@@ -742,13 +838,8 @@ func (s *server) snapshotLoop() {
 			case *SnapshotRecoveryRequest:
 				e.returnValue = s.processSnapshotRecoveryRequest(req)
 			}
-		}
-		// Callback to event.
-		e.c <- err
-
-		// Exit loop on state change.
-		if s.State() != Snapshotting {
-			break
+			// Callback to event.
+			e.c <- err
 		}
 	}
 }
@@ -765,11 +856,11 @@ func (s *server) Do(command Command) (interface{}, error) {
 }
 
 // Processes a command.
-func (s *server) processCommand(command Command, e *event) {
+func (s *server) processCommand(command Command, e *ev) {
 	s.debugln("server.command.process")
 
 	// Create an entry for the command in the log.
-	entry, err := s.log.createEntry(s.currentTerm, command)
+	entry, err := s.log.createEntry(s.currentTerm, command, e)
 
 	if err != nil {
 		s.debugln("server.command.log.entry.error:", err)
@@ -783,34 +874,12 @@ func (s *server) processCommand(command Command, e *event) {
 		return
 	}
 
-	// Issue a callback for the entry once it's committed.
-	go func() {
-		// Wait for the entry to be committed.
-		select {
-		case <-entry.commit:
-			var err error
-			s.debugln("server.command.commit")
-			e.returnValue, err = s.log.getEntryResult(entry, true)
-			e.c <- err
-		case <-time.After(time.Second):
-			s.debugln("server.command.timeout")
-			e.c <- CommandTimeoutError
-		}
-	}()
-
-	// Issue an append entries response for the server.
-	resp := newAppendEntriesResponse(s.currentTerm, true, s.log.currentIndex(), s.log.CommitIndex())
-	resp.append = true
-	resp.peer = s.Name()
-
-	// this must be async
-	// sendAsync is not really async every time
-	// when the sending speed of the user is larger than
-	// the processing speed of the server, the buffered channel
-	// will be full. Then sendAsync will become sync, which will
-	// cause deadlock here.
-	// so we use a goroutine to avoid the deadlock
-	go s.sendAsync(resp)
+	s.syncedPeer[s.Name()] = true
+	if len(s.peers) == 0 {
+		commitIndex := s.log.currentIndex()
+		s.log.setCommitIndex(commitIndex)
+		s.debugln("commit index ", commitIndex)
+	}
 }
 
 //--------------------------------------
@@ -826,7 +895,6 @@ func (s *server) AppendEntries(req *AppendEntriesRequest) *AppendEntriesResponse
 
 // Processes the "append entries" request.
 func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*AppendEntriesResponse, bool) {
-
 	s.traceln("server.ae.process")
 
 	if req.Term < s.currentTerm {
@@ -834,8 +902,17 @@ func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*Append
 		return newAppendEntriesResponse(s.currentTerm, false, s.log.currentIndex(), s.log.CommitIndex()), false
 	}
 
-	// Update term and leader.
-	s.setCurrentTerm(req.Term, req.LeaderName, true)
+	if req.Term == s.currentTerm {
+		_assert(s.state != Leader, "leader.elected.at.same.term.%d\n", s.currentTerm)
+		// change state to follower
+		s.state = Follower
+		// discover new leader when candidate
+		// save leader name when follower
+		s.leader = req.LeaderName
+	} else {
+		// Update term and leader.
+		s.updateCurrentTerm(req.Term, req.LeaderName)
+	}
 
 	// Reject if log doesn't contain a matching previous entry.
 	if err := s.log.truncate(req.PrevLogIndex, req.PrevLogTerm); err != nil {
@@ -855,7 +932,7 @@ func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*Append
 		return newAppendEntriesResponse(s.currentTerm, false, s.log.currentIndex(), s.log.CommitIndex()), true
 	}
 
-	// once the server appended and commited all the log entries from the leader
+	// once the server appended and committed all the log entries from the leader
 
 	return newAppendEntriesResponse(s.currentTerm, true, s.log.currentIndex(), s.log.CommitIndex()), true
 }
@@ -864,15 +941,14 @@ func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*Append
 // processed when the server is a leader. Responses received during other
 // states are dropped.
 func (s *server) processAppendEntriesResponse(resp *AppendEntriesResponse) {
-
 	// If we find a higher term then change to a follower and exit.
-	if resp.Term > s.currentTerm {
-		s.setCurrentTerm(resp.Term, "", false)
+	if resp.Term() > s.Term() {
+		s.updateCurrentTerm(resp.Term(), "")
 		return
 	}
 
 	// panic response if it's not successful.
-	if !resp.Success {
+	if !resp.Success() {
 		return
 	}
 
@@ -900,24 +976,30 @@ func (s *server) processAppendEntriesResponse(resp *AppendEntriesResponse) {
 	committedIndex := s.log.commitIndex
 
 	if commitIndex > committedIndex {
+		// leader needs to do a fsync before committing log entries
+		s.log.sync()
 		s.log.setCommitIndex(commitIndex)
 		s.debugln("commit index ", commitIndex)
-		for i := committedIndex; i < commitIndex; i++ {
-			if entry := s.log.getEntry(i + 1); entry != nil {
-				// if the leader is a new one and the entry came from the
-				// old leader, the commit channel will be nil and no go routine
-				// is waiting from this channel
-				// if we try to send to it, the new leader will get stuck
-				if entry.commit != nil {
-					select {
-					case entry.commit <- true:
-					default:
-						panic("server unable to send signal to commit channel")
-					}
-				}
-			}
-		}
 	}
+}
+
+// processVoteReponse processes a vote request:
+// 1. if the vote is granted for the current term of the candidate, return true
+// 2. if the vote is denied due to smaller term, update the term of this server
+//    which will also cause the candidate to step-down, and return false.
+// 3. if the vote is for a smaller term, ignore it and return false.
+func (s *server) processVoteResponse(resp *RequestVoteResponse) bool {
+	if resp.VoteGranted && resp.Term == s.currentTerm {
+		return true
+	}
+
+	if resp.Term > s.currentTerm {
+		s.debugln("server.candidate.vote.failed")
+		s.updateCurrentTerm(resp.Term, "")
+	} else {
+		s.debugln("server.candidate.vote: denied")
+	}
+	return false
 }
 
 //--------------------------------------
@@ -937,16 +1019,18 @@ func (s *server) RequestVote(req *RequestVoteRequest) *RequestVoteResponse {
 func (s *server) processRequestVoteRequest(req *RequestVoteRequest) (*RequestVoteResponse, bool) {
 
 	// If the request is coming from an old term then reject it.
-	if req.Term < s.currentTerm {
-		s.debugln("server.rv.error: stale term")
+	if req.Term < s.Term() {
+		s.debugln("server.rv.deny.vote: cause stale term")
 		return newRequestVoteResponse(s.currentTerm, false), false
 	}
 
-	s.setCurrentTerm(req.Term, "", false)
-
-	// If we've already voted for a different candidate then don't vote for this candidate.
-	if s.votedFor != "" && s.votedFor != req.CandidateName {
-		s.debugln("server.rv.error: duplicate vote: ", req.CandidateName,
+	// If the term of the request peer is larger than this node, update the term
+	// If the term is equal and we've already voted for a different candidate then
+	// don't vote for this candidate.
+	if req.Term > s.Term() {
+		s.updateCurrentTerm(req.Term, "")
+	} else if s.votedFor != "" && s.votedFor != req.CandidateName {
+		s.debugln("server.deny.vote: cause duplicate vote: ", req.CandidateName,
 			" already vote for ", s.votedFor)
 		return newRequestVoteResponse(s.currentTerm, false), false
 	}
@@ -954,7 +1038,7 @@ func (s *server) processRequestVoteRequest(req *RequestVoteRequest) (*RequestVot
 	// If the candidate's log is not at least as up-to-date as our last log then don't vote.
 	lastIndex, lastTerm := s.log.lastInfo()
 	if lastIndex > req.LastLogIndex || lastTerm > req.LastLogTerm {
-		s.debugln("server.rv.error: out of date log: ", req.CandidateName,
+		s.debugln("server.deny.vote: cause out of date log: ", req.CandidateName,
 			"Index :[", lastIndex, "]", " [", req.LastLogIndex, "]",
 			"Term :[", lastTerm, "]", " [", req.LastLogTerm, "]")
 		return newRequestVoteResponse(s.currentTerm, false), false
@@ -982,13 +1066,15 @@ func (s *server) AddPeer(name string, connectiongString string) error {
 
 	// Skip the Peer if it has the same name as the Server
 	if s.name != name {
-		peer := newPeer(s, name, connectiongString, s.heartbeatTimeout)
+		peer := newPeer(s, name, connectiongString, s.heartbeatInterval)
 
 		if s.State() == Leader {
 			peer.startHeartbeat()
 		}
 
 		s.peers[peer.Name] = peer
+
+		s.DispatchEvent(newEvent(AddPeerEventType, name, nil))
 	}
 
 	// Write the configuration to file.
@@ -1011,10 +1097,20 @@ func (s *server) RemovePeer(name string) error {
 
 		// Stop peer and remove it.
 		if s.State() == Leader {
-			peer.stopHeartbeat(true)
+			// We create a go routine here to avoid potential deadlock.
+			// We are holding log write lock when reach this line of code.
+			// Peer.stopHeartbeat can be blocked without go routine, if the
+			// target go routine (which we want to stop) is calling
+			// log.getEntriesAfter and waiting for log read lock.
+			// So we might be holding log lock and waiting for log lock,
+			// which lead to a deadlock.
+			// TODO(xiangli) refactor log lock
+			go peer.stopHeartbeat(true)
 		}
 
 		delete(s.peers, name)
+
+		s.DispatchEvent(newEvent(RemovePeerEventType, name, nil))
 	}
 
 	// Write the configuration to file.
@@ -1028,57 +1124,54 @@ func (s *server) RemovePeer(name string) error {
 //--------------------------------------
 
 func (s *server) TakeSnapshot() error {
-	//TODO put a snapshot mutex
-	s.debugln("take Snapshot")
-	if s.currentSnapshot != nil {
-		return errors.New("handling snapshot")
+	if s.stateMachine == nil {
+		return errors.New("Snapshot: Cannot create snapshot. Missing state machine.")
 	}
+
+	// Shortcut without lock
+	// Exit if the server is currently creating a snapshot.
+	if s.pendingSnapshot != nil {
+		return errors.New("Snapshot: Last snapshot is not finished.")
+	}
+
+	// TODO: acquire the lock and no more committed is allowed
+	// This will be done after finishing refactoring heartbeat
+	s.debugln("take.snapshot")
 
 	lastIndex, lastTerm := s.log.commitInfo()
 
-	if lastIndex == 0 {
-		return errors.New("No logs")
+	// check if there is log has been committed since the
+	// last snapshot.
+	if lastIndex == s.log.startIndex {
+		return nil
 	}
 
 	path := s.SnapshotPath(lastIndex, lastTerm)
+	// Attach snapshot to pending snapshot and save it to disk.
+	s.pendingSnapshot = &Snapshot{lastIndex, lastTerm, nil, nil, path}
 
-	var state []byte
-	var err error
-
-	if s.stateMachine != nil {
-		state, err = s.stateMachine.Save()
-
-		if err != nil {
-			return err
-		}
-
-	} else {
-		state = []byte{0}
+	state, err := s.stateMachine.Save()
+	if err != nil {
+		return err
 	}
 
-	peers := make([]*Peer, len(s.peers)+1)
-
-	i := 0
+	// Clone the list of peers.
+	peers := make([]*Peer, 0, len(s.peers)+1)
 	for _, peer := range s.peers {
-		peers[i] = peer.clone()
-		i++
+		peers = append(peers, peer.clone())
 	}
+	peers = append(peers, &Peer{Name: s.Name(), ConnectionString: s.connectionString})
 
-	peers[i] = &Peer{
-		Name:             s.Name(),
-		ConnectionString: s.connectionString,
-	}
-
-	s.currentSnapshot = &Snapshot{lastIndex, lastTerm, peers, state, path}
-
+	// Attach snapshot to pending snapshot and save it to disk.
+	s.pendingSnapshot.Peers = peers
+	s.pendingSnapshot.State = state
 	s.saveSnapshot()
 
-	// We keep some log entries after the snapshot
-	// We do not want to send the whole snapshot
-	// to the slightly slow machines
+	// We keep some log entries after the snapshot.
+	// We do not want to send the whole snapshot to the slightly slow machines
 	if lastIndex-s.log.startIndex > NumberOfLogEntriesAfterSnapshot {
 		compactIndex := lastIndex - NumberOfLogEntriesAfterSnapshot
-		compactTerm := s.log.getEntry(compactIndex).Term
+		compactTerm := s.log.getEntry(compactIndex).Term()
 		s.log.compact(compactIndex, compactTerm)
 	}
 
@@ -1087,25 +1180,25 @@ func (s *server) TakeSnapshot() error {
 
 // Retrieves the log path for the server.
 func (s *server) saveSnapshot() error {
-
-	if s.currentSnapshot == nil {
-		return errors.New("no snapshot to save")
+	if s.pendingSnapshot == nil {
+		return errors.New("pendingSnapshot.is.nil")
 	}
 
-	err := s.currentSnapshot.save()
-
-	if err != nil {
+	// Write snapshot to disk.
+	if err := s.pendingSnapshot.save(); err != nil {
 		return err
 	}
 
-	tmp := s.lastSnapshot
-	s.lastSnapshot = s.currentSnapshot
+	// Swap the current and last snapshots.
+	tmp := s.snapshot
+	s.snapshot = s.pendingSnapshot
 
-	// delete the previous snapshot if there is any change
-	if tmp != nil && !(tmp.LastIndex == s.lastSnapshot.LastIndex && tmp.LastTerm == s.lastSnapshot.LastTerm) {
+	// Delete the previous snapshot if there is any change
+	if tmp != nil && !(tmp.LastIndex == s.snapshot.LastIndex && tmp.LastTerm == s.snapshot.LastTerm) {
 		tmp.remove()
 	}
-	s.currentSnapshot = nil
+	s.pendingSnapshot = nil
+
 	return nil
 }
 
@@ -1121,18 +1214,16 @@ func (s *server) RequestSnapshot(req *SnapshotRequest) *SnapshotResponse {
 }
 
 func (s *server) processSnapshotRequest(req *SnapshotRequest) *SnapshotResponse {
-
 	// If the follower’s log contains an entry at the snapshot’s last index with a term
-	// that matches the snapshot’s last term
-	// Then the follower already has all the information found in the snapshot
-	// and can reply false
-
+	// that matches the snapshot’s last term, then the follower already has all the
+	// information found in the snapshot and can reply false.
 	entry := s.log.getEntry(req.LastIndex)
 
-	if entry != nil && entry.Term == req.LastTerm {
+	if entry != nil && entry.Term() == req.LastTerm {
 		return newSnapshotResponse(false)
 	}
 
+	// Update state.
 	s.setState(Snapshotting)
 
 	return newSnapshotResponse(true)
@@ -1145,113 +1236,107 @@ func (s *server) SnapshotRecoveryRequest(req *SnapshotRecoveryRequest) *Snapshot
 }
 
 func (s *server) processSnapshotRecoveryRequest(req *SnapshotRecoveryRequest) *SnapshotRecoveryResponse {
+	// Recover state sent from request.
+	if err := s.stateMachine.Recovery(req.State); err != nil {
+		panic("cannot recover from previous state")
+	}
 
-	s.stateMachine.Recovery(req.State)
-
-	// clear the peer map
+	// Recover the cluster configuration.
 	s.peers = make(map[string]*Peer)
-
-	// recovery the cluster configuration
 	for _, peer := range req.Peers {
 		s.AddPeer(peer.Name, peer.ConnectionString)
 	}
 
-	//update term and index
+	// Update log state.
 	s.currentTerm = req.LastTerm
-
 	s.log.updateCommitIndex(req.LastIndex)
 
-	snapshotPath := s.SnapshotPath(req.LastIndex, req.LastTerm)
-
-	s.currentSnapshot = &Snapshot{req.LastIndex, req.LastTerm, req.Peers, req.State, snapshotPath}
-
+	// Create local snapshot.
+	s.pendingSnapshot = &Snapshot{req.LastIndex, req.LastTerm, req.Peers, req.State, s.SnapshotPath(req.LastIndex, req.LastTerm)}
 	s.saveSnapshot()
 
-	// clear the previous log entries
+	// Clear the previous log entries.
 	s.log.compact(req.LastIndex, req.LastTerm)
 
 	return newSnapshotRecoveryResponse(req.LastTerm, true, req.LastIndex)
-
 }
 
 // Load a snapshot at restart
 func (s *server) LoadSnapshot() error {
+	// Open snapshot/ directory.
 	dir, err := os.OpenFile(path.Join(s.path, "snapshot"), os.O_RDONLY, 0)
 	if err != nil {
-
+		s.debugln("cannot.open.snapshot: ", err)
 		return err
 	}
 
+	// Retrieve a list of all snapshots.
 	filenames, err := dir.Readdirnames(-1)
-
 	if err != nil {
 		dir.Close()
 		panic(err)
 	}
-
 	dir.Close()
+
 	if len(filenames) == 0 {
-		return errors.New("no snapshot")
+		s.debugln("no.snapshot.to.load")
+		return nil
 	}
 
-	// not sure how many snapshot we should keep
+	// Grab the latest snapshot.
 	sort.Strings(filenames)
 	snapshotPath := path.Join(s.path, "snapshot", filenames[len(filenames)-1])
 
-	// should not fail
+	// Read snapshot data.
 	file, err := os.OpenFile(snapshotPath, os.O_RDONLY, 0)
-	defer file.Close()
 	if err != nil {
-		panic(err)
+		return err
+	}
+	defer file.Close()
+
+	// Check checksum.
+	var checksum uint32
+	n, err := fmt.Fscanf(file, "%08x\n", &checksum)
+	if err != nil {
+		return err
+	} else if n != 1 {
+		return errors.New("checksum.err: bad.snapshot.file")
 	}
 
-	// TODO check checksum first
-
-	var snapshotBytes []byte
-	var checksum uint32
-
-	n, err := fmt.Fscanf(file, "%08x\n", &checksum)
-
+	// Load remaining snapshot contents.
+	b, err := ioutil.ReadAll(file)
 	if err != nil {
 		return err
 	}
 
-	if n != 1 {
-		return errors.New("Bad snapshot file")
-	}
-
-	snapshotBytes, _ = ioutil.ReadAll(file)
-	s.debugln(string(snapshotBytes))
-
 	// Generate checksum.
-	byteChecksum := crc32.ChecksumIEEE(snapshotBytes)
-
+	byteChecksum := crc32.ChecksumIEEE(b)
 	if uint32(checksum) != byteChecksum {
 		s.debugln(checksum, " ", byteChecksum)
 		return errors.New("bad snapshot file")
 	}
 
-	err = json.Unmarshal(snapshotBytes, &s.lastSnapshot)
-
-	if err != nil {
-		s.debugln("unmarshal error: ", err)
+	// Decode snapshot.
+	if err = json.Unmarshal(b, &s.snapshot); err != nil {
+		s.debugln("unmarshal.snapshot.error: ", err)
 		return err
 	}
 
-	err = s.stateMachine.Recovery(s.lastSnapshot.State)
-
-	if err != nil {
-		s.debugln("recovery error: ", err)
+	// Recover snapshot into state machine.
+	if err = s.stateMachine.Recovery(s.snapshot.State); err != nil {
+		s.debugln("recovery.snapshot.error: ", err)
 		return err
 	}
 
-	for _, peer := range s.lastSnapshot.Peers {
+	// Recover cluster configuration.
+	for _, peer := range s.snapshot.Peers {
 		s.AddPeer(peer.Name, peer.ConnectionString)
 	}
 
-	s.log.startTerm = s.lastSnapshot.LastTerm
-	s.log.startIndex = s.lastSnapshot.LastIndex
-	s.log.updateCommitIndex(s.lastSnapshot.LastIndex)
+	// Update log state.
+	s.log.startTerm = s.snapshot.LastTerm
+	s.log.startIndex = s.snapshot.LastIndex
+	s.log.updateCommitIndex(s.snapshot.LastIndex)
 
 	return err
 }
@@ -1259,6 +1344,14 @@ func (s *server) LoadSnapshot() error {
 //--------------------------------------
 // Config File
 //--------------------------------------
+
+// Flushes commit index to the disk.
+// So when the raft server restarts, it will commit upto the flushed commitIndex.
+func (s *server) FlushCommitIndex() {
+	s.debugln("server.conf.update")
+	// Write the configuration to file.
+	s.writeConf()
+}
 
 func (s *server) writeConf() {
 
@@ -1280,7 +1373,7 @@ func (s *server) writeConf() {
 	confPath := path.Join(s.path, "conf")
 	tmpConfPath := path.Join(s.path, "conf.tmp")
 
-	err := ioutil.WriteFile(tmpConfPath, b, 0600)
+	err := writeFileSynced(tmpConfPath, b, 0600)
 
 	if err != nil {
 		panic(err)
@@ -1317,9 +1410,13 @@ func (s *server) readConf() error {
 //--------------------------------------
 
 func (s *server) debugln(v ...interface{}) {
-	debugf("[%s Term:%d] %s", s.name, s.currentTerm, fmt.Sprintln(v...))
+	if logLevel > Debug {
+		debugf("[%s Term:%d] %s", s.name, s.Term(), fmt.Sprintln(v...))
+	}
 }
 
 func (s *server) traceln(v ...interface{}) {
-	tracef("[%s] %s", s.name, fmt.Sprintln(v...))
+	if logLevel > Trace {
+		tracef("[%s] %s", s.name, fmt.Sprintln(v...))
+	}
 }

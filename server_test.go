@@ -1,19 +1,14 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"reflect"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 )
-
-//------------------------------------------------------------------------------
-//
-// Tests
-//
-//------------------------------------------------------------------------------
 
 //--------------------------------------
 // Request Vote
@@ -44,7 +39,10 @@ func TestServerRequestVoteDeniedForStaleTerm(t *testing.T) {
 		t.Fatalf("Server %s unable to join: %v", s.Name(), err)
 	}
 
+	s.(*server).mutex.Lock()
 	s.(*server).currentTerm = 2
+	s.(*server).mutex.Unlock()
+
 	defer s.Stop()
 	resp := s.RequestVote(newRequestVoteRequest(1, "foo", 1, 0))
 	if resp.Term != 2 || resp.VoteGranted {
@@ -64,7 +62,9 @@ func TestServerRequestVoteDeniedIfAlreadyVoted(t *testing.T) {
 		t.Fatalf("Server %s unable to join: %v", s.Name(), err)
 	}
 
+	s.(*server).mutex.Lock()
 	s.(*server).currentTerm = 2
+	s.(*server).mutex.Unlock()
 	defer s.Stop()
 	resp := s.RequestVote(newRequestVoteRequest(2, "foo", 1, 0))
 	if resp.Term != 2 || !resp.VoteGranted {
@@ -87,7 +87,9 @@ func TestServerRequestVoteApprovedIfAlreadyVotedInOlderTerm(t *testing.T) {
 
 	time.Sleep(time.Millisecond * 100)
 
+	s.(*server).mutex.Lock()
 	s.(*server).currentTerm = 2
+	s.(*server).mutex.Unlock()
 	defer s.Stop()
 	resp := s.RequestVote(newRequestVoteRequest(2, "foo", 2, 1))
 	if resp.Term != 2 || !resp.VoteGranted || s.VotedFor() != "foo" {
@@ -103,9 +105,9 @@ func TestServerRequestVoteApprovedIfAlreadyVotedInOlderTerm(t *testing.T) {
 // Ensure that a vote request is denied if the log is out of date.
 func TestServerRequestVoteDenyIfCandidateLogIsBehind(t *testing.T) {
 	tmpLog := newLog()
-	e0, _ := newLogEntry(tmpLog, 1, 1, &testCommand1{Val: "foo", I: 20})
-	e1, _ := newLogEntry(tmpLog, 2, 1, &testCommand2{X: 100})
-	e2, _ := newLogEntry(tmpLog, 3, 2, &testCommand1{Val: "bar", I: 0})
+	e0, _ := newLogEntry(tmpLog, nil, 1, 1, &testCommand1{Val: "foo", I: 20})
+	e1, _ := newLogEntry(tmpLog, nil, 2, 1, &testCommand2{X: 100})
+	e2, _ := newLogEntry(tmpLog, nil, 3, 2, &testCommand1{Val: "bar", I: 0})
 	s := newTestServerWithLog("1", &testTransporter{}, []*LogEntry{e0, e1, e2})
 
 	// start as a follower with term 2 and index 3
@@ -137,13 +139,54 @@ func TestServerRequestVoteDenyIfCandidateLogIsBehind(t *testing.T) {
 	}
 }
 
+func TestProcessVoteResponse(t *testing.T) {
+	// server Term: 0, status: Leader
+	// response Term : 1, granted
+	// Expectation: not success
+	// Server Term 1 status:Leader
+	server := &server{}
+	server.eventDispatcher = newEventDispatcher(server)
+	server.currentTerm = 0
+	server.state = Leader
+	response := &RequestVoteResponse{
+		VoteGranted: true,
+		Term:        1,
+	}
+	if success := server.processVoteResponse(response); success {
+		t.Fatal("Process should fail if the resp's term is larger than server's")
+	}
+	if server.state != Follower {
+		t.Fatal("Server should stepdown")
+	}
+
+	// server Term: 1, status: Follower
+	// response Term: 2, granted
+	// Expectation: not success
+	response.Term = 2
+	if success := server.processVoteResponse(response); success {
+		t.Fatal("Process should fail if the resp's term is larger than server's")
+	}
+	if server.state != Follower {
+		t.Fatal("Server should still be Follower")
+	}
+
+	server.currentTerm = 2
+	// server Term: 2, status: Follower
+	// response Term: 2
+	// Expectation: success
+	if success := server.processVoteResponse(response); !success {
+		t.Fatal("Process should success if the server's term is larger than resp's")
+	}
+
+}
+
 // //--------------------------------------
 // // Promotion
 // //--------------------------------------
 
 // // Ensure that we can self-promote a server to candidate, obtain votes and become a fearless leader.
 func TestServerPromoteSelf(t *testing.T) {
-	e0, _ := newLogEntry(newLog(), 1, 1, &testCommand1{Val: "foo", I: 20})
+	e0, _ := newLogEntry(newLog(), nil, 1, 1, &testCommand1{Val: "foo", I: 20})
 	s := newTestServerWithLog("1", &testTransporter{}, []*LogEntry{e0})
 
 	// start as a follower
@@ -191,15 +234,15 @@ func TestServerPromote(t *testing.T) {
 func TestServerAppendEntries(t *testing.T) {
 	s := newTestServer("1", &testTransporter{})
 
-	s.SetHeartbeatTimeout(time.Second * 10)
+	s.SetHeartbeatInterval(time.Second * 10)
 	s.Start()
 	defer s.Stop()
 
 	// Append single entry.
-	e, _ := newLogEntry(nil, 1, 1, &testCommand1{Val: "foo", I: 10})
+	e, _ := newLogEntry(nil, nil, 1, 1, &testCommand1{Val: "foo", I: 10})
 	entries := []*LogEntry{e}
 	resp := s.AppendEntries(newAppendEntriesRequest(1, 0, 0, 0, "ldr", entries))
-	if resp.Term != 1 || !resp.Success {
+	if resp.Term() != 1 || !resp.Success() {
 		t.Fatalf("AppendEntries failed: %v/%v", resp.Term, resp.Success)
 	}
 	if index, term := s.(*server).log.commitInfo(); index != 0 || term != 0 {
@@ -207,11 +250,11 @@ func TestServerAppendEntries(t *testing.T) {
 	}
 
 	// Append multiple entries + commit the last one.
-	e1, _ := newLogEntry(nil, 2, 1, &testCommand1{Val: "bar", I: 20})
-	e2, _ := newLogEntry(nil, 3, 1, &testCommand1{Val: "baz", I: 30})
+	e1, _ := newLogEntry(nil, nil, 2, 1, &testCommand1{Val: "bar", I: 20})
+	e2, _ := newLogEntry(nil, nil, 3, 1, &testCommand1{Val: "baz", I: 30})
 	entries = []*LogEntry{e1, e2}
 	resp = s.AppendEntries(newAppendEntriesRequest(1, 1, 1, 1, "ldr", entries))
-	if resp.Term != 1 || !resp.Success {
+	if resp.Term() != 1 || !resp.Success() {
 		t.Fatalf("AppendEntries failed: %v/%v", resp.Term, resp.Success)
 	}
 	if index, term := s.(*server).log.commitInfo(); index != 1 || term != 1 {
@@ -220,7 +263,7 @@ func TestServerAppendEntries(t *testing.T) {
 
 	// Send zero entries and commit everything.
 	resp = s.AppendEntries(newAppendEntriesRequest(2, 3, 1, 3, "ldr", []*LogEntry{}))
-	if resp.Term != 2 || !resp.Success {
+	if resp.Term() != 2 || !resp.Success() {
 		t.Fatalf("AppendEntries failed: %v/%v", resp.Term, resp.Success)
 	}
 	if index, term := s.(*server).log.commitInfo(); index != 3 || term != 1 {
@@ -235,13 +278,15 @@ func TestServerAppendEntriesWithStaleTermsAreRejected(t *testing.T) {
 	s.Start()
 
 	defer s.Stop()
+	s.(*server).mutex.Lock()
 	s.(*server).currentTerm = 2
+	s.(*server).mutex.Unlock()
 
 	// Append single entry.
-	e, _ := newLogEntry(nil, 1, 1, &testCommand1{Val: "foo", I: 10})
+	e, _ := newLogEntry(nil, nil, 1, 1, &testCommand1{Val: "foo", I: 10})
 	entries := []*LogEntry{e}
 	resp := s.AppendEntries(newAppendEntriesRequest(1, 0, 0, 0, "ldr", entries))
-	if resp.Term != 2 || resp.Success {
+	if resp.Term() != 2 || resp.Success() {
 		t.Fatalf("AppendEntries should have failed: %v/%v", resp.Term, resp.Success)
 	}
 	if index, term := s.(*server).log.commitInfo(); index != 0 || term != 0 {
@@ -256,19 +301,19 @@ func TestServerAppendEntriesRejectedIfAlreadyCommitted(t *testing.T) {
 	defer s.Stop()
 
 	// Append single entry + commit.
-	e1, _ := newLogEntry(nil, 1, 1, &testCommand1{Val: "foo", I: 10})
-	e2, _ := newLogEntry(nil, 2, 1, &testCommand1{Val: "foo", I: 15})
+	e1, _ := newLogEntry(nil, nil, 1, 1, &testCommand1{Val: "foo", I: 10})
+	e2, _ := newLogEntry(nil, nil, 2, 1, &testCommand1{Val: "foo", I: 15})
 	entries := []*LogEntry{e1, e2}
 	resp := s.AppendEntries(newAppendEntriesRequest(1, 0, 0, 2, "ldr", entries))
-	if resp.Term != 1 || !resp.Success {
+	if resp.Term() != 1 || !resp.Success() {
 		t.Fatalf("AppendEntries failed: %v/%v", resp.Term, resp.Success)
 	}
 
 	// Append entry again (post-commit).
-	e, _ := newLogEntry(nil, 2, 1, &testCommand1{Val: "bar", I: 20})
+	e, _ := newLogEntry(nil, nil, 2, 1, &testCommand1{Val: "bar", I: 20})
 	entries = []*LogEntry{e}
 	resp = s.AppendEntries(newAppendEntriesRequest(1, 2, 1, 1, "ldr", entries))
-	if resp.Term != 1 || resp.Success {
+	if resp.Term() != 1 || resp.Success() {
 		t.Fatalf("AppendEntries should have failed: %v/%v", resp.Term, resp.Success)
 	}
 }
@@ -279,22 +324,35 @@ func TestServerAppendEntriesOverwritesUncommittedEntries(t *testing.T) {
 	s.Start()
 	defer s.Stop()
 
-	entry1, _ := newLogEntry(nil, 1, 1, &testCommand1{Val: "foo", I: 10})
-	entry2, _ := newLogEntry(nil, 2, 1, &testCommand1{Val: "foo", I: 15})
-	entry3, _ := newLogEntry(nil, 2, 2, &testCommand1{Val: "bar", I: 20})
+	entry1, _ := newLogEntry(s.(*server).log, nil, 1, 1, &testCommand1{Val: "foo", I: 10})
+	entry2, _ := newLogEntry(s.(*server).log, nil, 2, 1, &testCommand1{Val: "foo", I: 15})
+	entry3, _ := newLogEntry(s.(*server).log, nil, 2, 2, &testCommand1{Val: "bar", I: 20})
 
 	// Append single entry + commit.
 	entries := []*LogEntry{entry1, entry2}
 	resp := s.AppendEntries(newAppendEntriesRequest(1, 0, 0, 1, "ldr", entries))
-	if resp.Term != 1 || !resp.Success || s.(*server).log.commitIndex != 1 || !reflect.DeepEqual(s.(*server).log.entries, []*LogEntry{entry1, entry2}) {
+	if resp.Term() != 1 || !resp.Success() || s.(*server).log.commitIndex != 1 {
 		t.Fatalf("AppendEntries failed: %v/%v", resp.Term, resp.Success)
+	}
+
+	for i, entry := range s.(*server).log.entries {
+		if entry.Term() != entries[i].Term() || entry.Index() != entries[i].Index() || !bytes.Equal(entry.Command(), entries[i].Command()) {
+			t.Fatalf("AppendEntries failed: %v/%v", resp.Term, resp.Success)
+		}
 	}
 
 	// Append entry that overwrites the second (uncommitted) entry.
 	entries = []*LogEntry{entry3}
 	resp = s.AppendEntries(newAppendEntriesRequest(2, 1, 1, 2, "ldr", entries))
-	if resp.Term != 2 || !resp.Success || s.(*server).log.commitIndex != 2 || !reflect.DeepEqual(s.(*server).log.entries, []*LogEntry{entry1, entry3}) {
+	if resp.Term() != 2 || !resp.Success() || s.(*server).log.commitIndex != 2 {
 		t.Fatalf("AppendEntries should have succeeded: %v/%v", resp.Term, resp.Success)
+	}
+
+	entries = []*LogEntry{entry1, entry3}
+	for i, entry := range s.(*server).log.entries {
+		if entry.Term() != entries[i].Term() || entry.Index() != entries[i].Index() || !bytes.Equal(entry.Command(), entries[i].Command()) {
+			t.Fatalf("AppendEntries failed: %v/%v", resp.Term, resp.Success)
+		}
 	}
 }
 
@@ -328,13 +386,23 @@ func TestServerRecoverFromPreviousLogAndConf(t *testing.T) {
 		mutex.RLock()
 		target := servers[peer.Name]
 		mutex.RUnlock()
-		return target.RequestVote(req)
+
+		b, _ := json.Marshal(req)
+		clonedReq := &RequestVoteRequest{}
+		json.Unmarshal(b, clonedReq)
+
+		return target.RequestVote(clonedReq)
 	}
 	transporter.sendAppendEntriesRequestFunc = func(s Server, peer *Peer, req *AppendEntriesRequest) *AppendEntriesResponse {
 		mutex.RLock()
 		target := servers[peer.Name]
 		mutex.RUnlock()
-		return target.AppendEntries(req)
+
+		b, _ := json.Marshal(req)
+		clonedReq := &AppendEntriesRequest{}
+		json.Unmarshal(b, clonedReq)
+
+		return target.AppendEntries(clonedReq)
 	}
 
 	disTransporter := &testTransporter{}
@@ -359,19 +427,21 @@ func TestServerRecoverFromPreviousLogAndConf(t *testing.T) {
 	for _, name := range names {
 		s := newTestServer(name, transporter)
 
+		mutex.Lock()
 		servers[name] = s
+		mutex.Unlock()
 		paths[name] = s.Path()
 
 		if name == "1" {
 			leader = s
-			s.SetHeartbeatTimeout(testHeartbeatTimeout)
+			s.SetHeartbeatInterval(testHeartbeatInterval)
 			s.Start()
-			time.Sleep(testHeartbeatTimeout)
+			time.Sleep(testHeartbeatInterval)
 		} else {
 			s.SetElectionTimeout(testElectionTimeout)
-			s.SetHeartbeatTimeout(testHeartbeatTimeout)
+			s.SetHeartbeatInterval(testHeartbeatInterval)
 			s.Start()
-			time.Sleep(testHeartbeatTimeout)
+			time.Sleep(testHeartbeatInterval)
 		}
 		if _, err := leader.Do(&DefaultJoinCommand{Name: name}); err != nil {
 			t.Fatalf("Unable to join server[%s]: %v", name, err)
@@ -386,7 +456,7 @@ func TestServerRecoverFromPreviousLogAndConf(t *testing.T) {
 		}
 	}
 
-	time.Sleep(2 * testHeartbeatTimeout)
+	time.Sleep(2 * testHeartbeatInterval)
 
 	for _, name := range names {
 		s := servers[name]
@@ -444,7 +514,7 @@ func TestServerSingleNode(t *testing.T) {
 
 	s.Start()
 
-	time.Sleep(testHeartbeatTimeout)
+	time.Sleep(testHeartbeatInterval)
 
 	// Join the server to itself.
 	if _, err := s.Do(&DefaultJoinCommand{Name: "1"}); err != nil {
@@ -474,13 +544,46 @@ func TestServerMultiNode(t *testing.T) {
 		mutex.RLock()
 		target := servers[peer.Name]
 		mutex.RUnlock()
-		return target.RequestVote(req)
+
+		b, _ := json.Marshal(req)
+		clonedReq := &RequestVoteRequest{}
+		json.Unmarshal(b, clonedReq)
+
+		c := make(chan *RequestVoteResponse)
+
+		go func() {
+			c <- target.RequestVote(clonedReq)
+		}()
+
+		select {
+		case resp := <-c:
+			return resp
+		case <-time.After(time.Millisecond * 200):
+			return nil
+		}
+
 	}
 	transporter.sendAppendEntriesRequestFunc = func(s Server, peer *Peer, req *AppendEntriesRequest) *AppendEntriesResponse {
 		mutex.RLock()
 		target := servers[peer.Name]
 		mutex.RUnlock()
-		return target.AppendEntries(req)
+
+		b, _ := json.Marshal(req)
+		clonedReq := &AppendEntriesRequest{}
+		json.Unmarshal(b, clonedReq)
+
+		c := make(chan *AppendEntriesResponse)
+
+		go func() {
+			c <- target.AppendEntries(clonedReq)
+		}()
+
+		select {
+		case resp := <-c:
+			return resp
+		case <-time.After(time.Millisecond * 200):
+			return nil
+		}
 	}
 
 	disTransporter := &testTransporter{}
@@ -511,14 +614,14 @@ func TestServerMultiNode(t *testing.T) {
 
 		if name == "1" {
 			leader = s
-			s.SetHeartbeatTimeout(testHeartbeatTimeout)
+			s.SetHeartbeatInterval(testHeartbeatInterval)
 			s.Start()
-			time.Sleep(testHeartbeatTimeout)
+			time.Sleep(testHeartbeatInterval)
 		} else {
 			s.SetElectionTimeout(testElectionTimeout)
-			s.SetHeartbeatTimeout(testHeartbeatTimeout)
+			s.SetHeartbeatInterval(testHeartbeatInterval)
 			s.Start()
-			time.Sleep(testHeartbeatTimeout)
+			time.Sleep(testHeartbeatInterval)
 		}
 		if _, err := leader.Do(&DefaultJoinCommand{Name: name}); err != nil {
 			t.Fatalf("Unable to join server[%s]: %v", name, err)

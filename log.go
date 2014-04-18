@@ -2,13 +2,13 @@ package raft
 
 import (
 	"bufio"
-	"code.google.com/p/goprotobuf/proto"
 	"errors"
 	"fmt"
-	"github.com/coreos/raft/protobuf"
 	"io"
 	"os"
 	"sync"
+
+	"github.com/coreos/raft/protobuf"
 )
 
 //------------------------------------------------------------------------------
@@ -19,17 +19,14 @@ import (
 
 // A log is a collection of log entries that are persisted to durable storage.
 type Log struct {
-	ApplyFunc   func(Command) (interface{}, error)
+	ApplyFunc   func(*LogEntry, Command) (interface{}, error)
 	file        *os.File
 	path        string
 	entries     []*LogEntry
-	results     []*logResult
 	commitIndex uint64
 	mutex       sync.RWMutex
 	startIndex  uint64 // the index before the first entry in the Log entries
 	startTerm   uint64
-	pBuffer     *proto.Buffer
-	pLogEntry   *protobuf.ProtoLogEntry
 }
 
 // The results of the applying a log entry.
@@ -47,9 +44,7 @@ type logResult struct {
 // Creates a new log.
 func newLog() *Log {
 	return &Log{
-		entries:   make([]*LogEntry, 0),
-		pBuffer:   proto.NewBuffer(nil),
-		pLogEntry: &protobuf.ProtoLogEntry{},
+		entries: make([]*LogEntry, 0),
 	}
 }
 
@@ -74,11 +69,7 @@ func (l *Log) CommitIndex() uint64 {
 func (l *Log) currentIndex() uint64 {
 	l.mutex.RLock()
 	defer l.mutex.RUnlock()
-
-	if len(l.entries) == 0 {
-		return l.startIndex
-	}
-	return l.entries[len(l.entries)-1].Index
+	return l.internalCurrentIndex()
 }
 
 // The current index in the log without locking
@@ -86,7 +77,7 @@ func (l *Log) internalCurrentIndex() uint64 {
 	if len(l.entries) == 0 {
 		return l.startIndex
 	}
-	return l.entries[len(l.entries)-1].Index
+	return l.entries[len(l.entries)-1].Index()
 }
 
 // The next index in the log.
@@ -107,7 +98,7 @@ func (l *Log) lastCommandName() string {
 	defer l.mutex.RUnlock()
 	if len(l.entries) > 0 {
 		if entry := l.entries[len(l.entries)-1]; entry != nil {
-			return entry.CommandName
+			return entry.CommandName()
 		}
 	}
 	return ""
@@ -125,7 +116,7 @@ func (l *Log) currentTerm() uint64 {
 	if len(l.entries) == 0 {
 		return l.startTerm
 	}
-	return l.entries[len(l.entries)-1].Term
+	return l.entries[len(l.entries)-1].Term()
 }
 
 //------------------------------------------------------------------------------
@@ -166,10 +157,10 @@ func (l *Log) open(path string) error {
 	// Read the file and decode entries.
 	for {
 		// Instantiate log entry and decode into it.
-		entry, _ := newLogEntry(l, 0, 0, nil)
+		entry, _ := newLogEntry(l, nil, 0, 0, nil)
 		entry.Position, _ = l.file.Seek(0, os.SEEK_CUR)
 
-		n, err := entry.decode(l.file)
+		n, err := entry.Decode(l.file)
 		if err != nil {
 			if err == io.EOF {
 				debugln("open.log.append: finish ")
@@ -180,23 +171,21 @@ func (l *Log) open(path string) error {
 			}
 			break
 		}
-		if entry.Index > l.startIndex {
+		if entry.Index() > l.startIndex {
 			// Append entry.
 			l.entries = append(l.entries, entry)
-			if entry.Index <= l.commitIndex {
-				command, err := newCommand(entry.CommandName, entry.Command)
+			if entry.Index() <= l.commitIndex {
+				command, err := newCommand(entry.CommandName(), entry.Command())
 				if err != nil {
 					continue
 				}
-				l.ApplyFunc(command)
+				l.ApplyFunc(entry, command)
 			}
-			debugln("open.log.append log index ", entry.Index)
+			debugln("open.log.append log index ", entry.Index())
 		}
 
 		readBytes += int64(n)
 	}
-	l.results = make([]*logResult, len(l.entries))
-
 	debugln("open.log.recovery number of log ", len(l.entries))
 	return nil
 }
@@ -211,7 +200,11 @@ func (l *Log) close() {
 		l.file = nil
 	}
 	l.entries = make([]*LogEntry, 0)
-	l.results = make([]*logResult, 0)
+}
+
+// sync to disk
+func (l *Log) sync() error {
+	return l.file.Sync()
 }
 
 //--------------------------------------
@@ -219,8 +212,8 @@ func (l *Log) close() {
 //--------------------------------------
 
 // Creates a log entry associated with this log.
-func (l *Log) createEntry(term uint64, command Command) (*LogEntry, error) {
-	return newLogEntry(l, l.nextIndex(), term, command)
+func (l *Log) createEntry(term uint64, command Command, e *ev) (*LogEntry, error) {
+	return newLogEntry(l, e, l.nextIndex(), term, command)
 }
 
 // Retrieves an entry from the log. If the entry has been eliminated because
@@ -238,15 +231,15 @@ func (l *Log) getEntry(index uint64) *LogEntry {
 // Checks if the log contains a given index/term combination.
 func (l *Log) containsEntry(index uint64, term uint64) bool {
 	entry := l.getEntry(index)
-	return (entry != nil && entry.Term == term)
+	return (entry != nil && entry.Term() == term)
 }
 
 // Retrieves a list of entries after a given index as well as the term of the
 // index provided. A nil list of entries is returned if the index no longer
 // exists because a snapshot was made.
 func (l *Log) getEntriesAfter(index uint64, maxLogEntriesPerRequest uint64) ([]*LogEntry, uint64) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
+	l.mutex.RLock()
+	defer l.mutex.RUnlock()
 
 	// Return nil if index is before the start of the log.
 	if index < l.startIndex {
@@ -270,43 +263,14 @@ func (l *Log) getEntriesAfter(index uint64, maxLogEntriesPerRequest uint64) ([]*
 	entries := l.entries[index-l.startIndex:]
 	length := len(entries)
 
-	traceln("log.entriesAfter: startIndex:", l.startIndex, " lenght", len(l.entries))
+	traceln("log.entriesAfter: startIndex:", l.startIndex, " length", len(l.entries))
 
 	if uint64(length) < maxLogEntriesPerRequest {
 		// Determine the term at the given entry and return a subslice.
-		return entries, l.entries[index-1-l.startIndex].Term
+		return entries, l.entries[index-1-l.startIndex].Term()
 	} else {
-		return entries[:maxLogEntriesPerRequest], l.entries[index-1-l.startIndex].Term
+		return entries[:maxLogEntriesPerRequest], l.entries[index-1-l.startIndex].Term()
 	}
-}
-
-// Retrieves the return value and error for an entry. The result can only exist
-// after the entry has been committed.
-func (l *Log) getEntryResult(entry *LogEntry, clear bool) (interface{}, error) {
-	l.mutex.RLock()
-	defer l.mutex.RUnlock()
-
-	if entry == nil {
-		panic("raft: Log entry required for error retrieval")
-	}
-	debugln("getEntryResult.result index: ", entry.Index-l.startIndex-1)
-	// If a result exists for the entry then return it with its error.
-	if entry.Index > l.startIndex && entry.Index <= l.startIndex+uint64(len(l.results)) {
-		if result := l.results[entry.Index-l.startIndex-1]; result != nil {
-
-			// keep the records before remove it
-			returnValue, err := result.returnValue, result.err
-
-			// Remove reference to result if it's being cleared after retrieval.
-			if clear {
-				result.returnValue = nil
-			}
-
-			return returnValue, err
-		}
-	}
-
-	return nil, nil
 }
 
 //--------------------------------------
@@ -330,10 +294,10 @@ func (l *Log) commitInfo() (index uint64, term uint64) {
 	// Return the last index & term from the last committed entry.
 	debugln("commitInfo.get.[", l.commitIndex, "/", l.startIndex, "]")
 	entry := l.entries[l.commitIndex-1-l.startIndex]
-	return entry.Index, entry.Term
+	return entry.Index(), entry.Term()
 }
 
-// Retrieves the last index and term that has been committed to the log.
+// Retrieves the last index and term that has been appended to the log.
 func (l *Log) lastInfo() (index uint64, term uint64) {
 	l.mutex.RLock()
 	defer l.mutex.RUnlock()
@@ -345,7 +309,7 @@ func (l *Log) lastInfo() (index uint64, term uint64) {
 
 	// Return the last index & term
 	entry := l.entries[len(l.entries)-1]
-	return entry.Index, entry.Term
+	return entry.Index(), entry.Term()
 }
 
 // Updates the commit index
@@ -373,7 +337,7 @@ func (l *Log) setCommitIndex(index uint64) error {
 	// Do not allow previous indices to be committed again.
 
 	// This could happens, since the guarantee is that the new leader has up-to-dated
-	// log entires rather than has most up-to-dated committed index
+	// log entries rather than has most up-to-dated committed index
 
 	// For example, Leader 1 send log 80 to follower 2 and follower 3
 	// follower 2 and follow 3 all got the new entries and reply
@@ -395,18 +359,22 @@ func (l *Log) setCommitIndex(index uint64) error {
 		entry := l.entries[entryIndex]
 
 		// Update commit index.
-		l.commitIndex = entry.Index
+		l.commitIndex = entry.Index()
 
 		// Decode the command.
-		command, err := newCommand(entry.CommandName, entry.Command)
+		command, err := newCommand(entry.CommandName(), entry.Command())
 		if err != nil {
 			return err
 		}
 
 		// Apply the changes to the state machine and store the error code.
-		returnValue, err := l.ApplyFunc(command)
-		debugln("setCommitIndex.set.result index: ", entryIndex)
-		l.results[entryIndex] = &logResult{returnValue: returnValue, err: err}
+		returnValue, err := l.ApplyFunc(entry, command)
+
+		debugf("setCommitIndex.set.result index: %v, entries index: %v", i, entryIndex)
+		if entry.event != nil {
+			entry.event.returnValue = returnValue
+			entry.event.c <- err
+		}
 	}
 	return nil
 }
@@ -447,13 +415,21 @@ func (l *Log) truncate(index uint64, term uint64) error {
 		debugln("log.truncate.clear")
 		l.file.Truncate(0)
 		l.file.Seek(0, os.SEEK_SET)
+
+		// notify clients if this node is the previous leader
+		for _, entry := range l.entries {
+			if entry.event != nil {
+				entry.event.c <- errors.New("command failed to be committed due to node failure")
+			}
+		}
+
 		l.entries = []*LogEntry{}
 	} else {
 		// Do not truncate if the entry at index does not have the matching term.
 		entry := l.entries[index-l.startIndex-1]
-		if len(l.entries) > 0 && entry.Term != term {
+		if len(l.entries) > 0 && entry.Term() != term {
 			debugln("log.truncate.termMismatch")
-			return fmt.Errorf("raft.Log: Entry at index does not have matching term (%v): (IDX=%v, TERM=%v)", entry.Term, index, term)
+			return fmt.Errorf("raft.Log: Entry at index does not have matching term (%v): (IDX=%v, TERM=%v)", entry.Term(), index, term)
 		}
 
 		// Otherwise truncate up to the desired entry.
@@ -462,6 +438,15 @@ func (l *Log) truncate(index uint64, term uint64) error {
 			position := l.entries[index-l.startIndex].Position
 			l.file.Truncate(position)
 			l.file.Seek(position, os.SEEK_SET)
+
+			// notify clients if this node is the previous leader
+			for i := index - l.startIndex; i < uint64(len(l.entries)); i++ {
+				entry := l.entries[i]
+				if entry.event != nil {
+					entry.event.c <- errors.New("command failed to be committed due to node failure")
+				}
+			}
+
 			l.entries = l.entries[0 : index-l.startIndex]
 		}
 	}
@@ -473,9 +458,8 @@ func (l *Log) truncate(index uint64, term uint64) error {
 // Append
 //--------------------------------------
 
-// Appends a series of entries to the log. These entries are not written to
-// disk until setCommitIndex() is called.
-func (l *Log) appendEntries(entries []*LogEntry) error {
+// Appends a series of entries to the log.
+func (l *Log) appendEntries(entries []*protobuf.LogEntry) error {
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 
@@ -486,23 +470,34 @@ func (l *Log) appendEntries(entries []*LogEntry) error {
 	var size int64
 	var err error
 	// Append each entry but exit if we hit an error.
-	for _, entry := range entries {
-		entry.log = l
-		if size, err = l.writeEntry(entry, w); err != nil {
+	for i := range entries {
+		logEntry := &LogEntry{
+			log:      l,
+			Position: startPosition,
+			pb:       entries[i],
+		}
+
+		if size, err = l.writeEntry(logEntry, w); err != nil {
 			return err
 		}
-		entry.Position = startPosition
+
 		startPosition += size
 	}
 	w.Flush()
+	err = l.sync()
+
+	if err != nil {
+		panic(err)
+	}
 
 	return nil
 }
 
-// Writes a single log entry to the end of the log. This function does not
-// obtain a lock and should only be used internally. Use AppendEntries() and
-// AppendEntry() to use it externally.
+// Writes a single log entry to the end of the log.
 func (l *Log) appendEntry(entry *LogEntry) error {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
 	if l.file == nil {
 		return errors.New("raft.Log: Log is not open")
 	}
@@ -510,10 +505,10 @@ func (l *Log) appendEntry(entry *LogEntry) error {
 	// Make sure the term and index are greater than the previous.
 	if len(l.entries) > 0 {
 		lastEntry := l.entries[len(l.entries)-1]
-		if entry.Term < lastEntry.Term {
-			return fmt.Errorf("raft.Log: Cannot append entry with earlier term (%x:%x <= %x:%x)", entry.Term, entry.Index, lastEntry.Term, lastEntry.Index)
-		} else if entry.Term == lastEntry.Term && entry.Index <= lastEntry.Index {
-			return fmt.Errorf("raft.Log: Cannot append entry with earlier index in the same term (%x:%x <= %x:%x)", entry.Term, entry.Index, lastEntry.Term, lastEntry.Index)
+		if entry.Term() < lastEntry.Term() {
+			return fmt.Errorf("raft.Log: Cannot append entry with earlier term (%x:%x <= %x:%x)", entry.Term(), entry.Index(), lastEntry.Term(), lastEntry.Index())
+		} else if entry.Term() == lastEntry.Term() && entry.Index() <= lastEntry.Index() {
+			return fmt.Errorf("raft.Log: Cannot append entry with earlier index in the same term (%x:%x <= %x:%x)", entry.Term(), entry.Index(), lastEntry.Term(), lastEntry.Index())
 		}
 	}
 
@@ -522,13 +517,12 @@ func (l *Log) appendEntry(entry *LogEntry) error {
 	entry.Position = position
 
 	// Write to storage.
-	if _, err := entry.encode(l.file); err != nil {
+	if _, err := entry.Encode(l.file); err != nil {
 		return err
 	}
 
 	// Append to entries list if stored on disk.
 	l.entries = append(l.entries, entry)
-	l.results = append(l.results, nil)
 
 	return nil
 }
@@ -542,22 +536,21 @@ func (l *Log) writeEntry(entry *LogEntry, w io.Writer) (int64, error) {
 	// Make sure the term and index are greater than the previous.
 	if len(l.entries) > 0 {
 		lastEntry := l.entries[len(l.entries)-1]
-		if entry.Term < lastEntry.Term {
-			return -1, fmt.Errorf("raft.Log: Cannot append entry with earlier term (%x:%x <= %x:%x)", entry.Term, entry.Index, lastEntry.Term, lastEntry.Index)
-		} else if entry.Term == lastEntry.Term && entry.Index <= lastEntry.Index {
-			return -1, fmt.Errorf("raft.Log: Cannot append entry with earlier index in the same term (%x:%x <= %x:%x)", entry.Term, entry.Index, lastEntry.Term, lastEntry.Index)
+		if entry.Term() < lastEntry.Term() {
+			return -1, fmt.Errorf("raft.Log: Cannot append entry with earlier term (%x:%x <= %x:%x)", entry.Term(), entry.Index(), lastEntry.Term(), lastEntry.Index())
+		} else if entry.Term() == lastEntry.Term() && entry.Index() <= lastEntry.Index() {
+			return -1, fmt.Errorf("raft.Log: Cannot append entry with earlier index in the same term (%x:%x <= %x:%x)", entry.Term(), entry.Index(), lastEntry.Term(), lastEntry.Index())
 		}
 	}
 
 	// Write to storage.
-	size, err := entry.encode(w)
+	size, err := entry.Encode(w)
 	if err != nil {
 		return -1, err
 	}
 
 	// Append to entries list if stored on disk.
 	l.entries = append(l.entries, entry)
-	l.results = append(l.results, nil)
 
 	return int64(size), nil
 }
@@ -569,7 +562,6 @@ func (l *Log) writeEntry(entry *LogEntry, w io.Writer) (int64, error) {
 // compact the log before index (including index)
 func (l *Log) compact(index uint64, term uint64) error {
 	var entries []*LogEntry
-	var results []*logResult
 
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
@@ -582,15 +574,14 @@ func (l *Log) compact(index uint64, term uint64) error {
 	// we just recovery from on snapshot
 	if index >= l.internalCurrentIndex() {
 		entries = make([]*LogEntry, 0)
-		results = make([]*logResult, 0)
 	} else {
 		// get all log entries after index
 		entries = l.entries[index-l.startIndex:]
-		results = l.results[index-l.startIndex:]
 	}
 
 	// create a new log file and add all the entries
-	file, err := os.OpenFile(l.path+".new", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	new_file_path := l.path + ".new"
+	file, err := os.OpenFile(new_file_path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -598,29 +589,30 @@ func (l *Log) compact(index uint64, term uint64) error {
 		position, _ := l.file.Seek(0, os.SEEK_CUR)
 		entry.Position = position
 
-		if _, err = entry.encode(file); err != nil {
+		if _, err = entry.Encode(file); err != nil {
+			file.Close()
+			os.Remove(new_file_path)
 			return err
 		}
 	}
-	// close the current log file
-	l.file.Close()
+	file.Sync()
 
-	// remove the current log file to .bak
-	err = os.Remove(l.path)
-	if err != nil {
-		return err
-	}
+	old_file := l.file
 
 	// rename the new log file
-	err = os.Rename(l.path+".new", l.path)
+	err = os.Rename(new_file_path, l.path)
 	if err != nil {
+		file.Close()
+		os.Remove(new_file_path)
 		return err
 	}
 	l.file = file
 
+	// close the old log file
+	old_file.Close()
+
 	// compaction the in memory log
 	l.entries = entries
-	l.results = results
 	l.startIndex = index
 	l.startTerm = term
 	return nil
