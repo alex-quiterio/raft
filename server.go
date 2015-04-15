@@ -55,6 +55,7 @@ const ElectionTimeoutThresholdPercent = 0.8
 var NotLeaderError = errors.New("raft.Server: Not current leader")
 var DuplicatePeerError = errors.New("raft.Server: Duplicate peer")
 var CommandTimeoutError = errors.New("raft: Command timeout")
+var StopError = errors.New("raft: Has been stopped")
 
 //------------------------------------------------------------------------------
 //
@@ -123,7 +124,7 @@ type server struct {
 	mutex      sync.RWMutex
 	syncedPeer map[string]bool
 
-	stopped           chan chan bool
+	stopped           chan bool
 	c                 chan *ev
 	electionTimeout   time.Duration
 	heartbeatInterval time.Duration
@@ -140,6 +141,8 @@ type server struct {
 	maxLogEntriesPerRequest uint64
 
 	connectionString string
+
+	routineGroup sync.WaitGroup
 }
 
 // An internal event to be processed by the server's event loop.
@@ -177,7 +180,6 @@ func NewServer(name string, path string, transporter Transporter, stateMachine S
 		state:                   Stopped,
 		peers:                   make(map[string]*Peer),
 		log:                     newLog(),
-		stopped:                 make(chan chan bool),
 		c:                       make(chan *ev, 256),
 		electionTimeout:         DefaultElectionTimeout,
 		heartbeatInterval:       DefaultHeartbeatInterval,
@@ -332,6 +334,8 @@ func (s *server) IsLogEmpty() bool {
 
 // A list of all the log entries. This should only be used for debugging purposes.
 func (s *server) LogEntries() []*LogEntry {
+	s.log.mutex.RLock()
+	defer s.log.mutex.RUnlock()
 	return s.log.entries
 }
 
@@ -358,8 +362,8 @@ func (s *server) promotable() bool {
 
 // Retrieves the number of member servers in the consensus.
 func (s *server) MemberCount() int {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 	return len(s.peers) + 1
 }
 
@@ -440,6 +444,9 @@ func (s *server) Start() error {
 		return err
 	}
 
+	// stopped needs to be allocated each time server starts
+	// because it is closed at `Stop`.
+	s.stopped = make(chan bool)
 	s.setState(Follower)
 
 	// If no log entries exist then
@@ -457,19 +464,27 @@ func (s *server) Start() error {
 
 	debugln(s.GetState())
 
-	go s.loop()
+	s.routineGroup.Add(1)
+	go func() {
+		defer s.routineGroup.Done()
+		s.loop()
+	}()
 
 	return nil
 }
 
-// Init initializes the raft server
+// Init initializes the raft server.
+// If there is no previous log file under the given path, Init() will create an empty log file.
+// Otherwise, Init() will load in the log entries from the log file.
 func (s *server) Init() error {
 	if s.Running() {
 		return fmt.Errorf("raft.Server: Server already running[%v]", s.state)
 	}
 
-	// server has been initialized or server was stopped after initialized
-	if s.state == Initialized || !s.log.isEmpty() {
+	// Server has been initialized or server was stopped after initialized
+	// If log has been initialized, we know that the server was stopped after
+	// running.
+	if s.state == Initialized || s.log.initialized {
 		s.state = Initialized
 		return nil
 	}
@@ -501,13 +516,17 @@ func (s *server) Init() error {
 
 // Shuts down the server.
 func (s *server) Stop() {
-	stop := make(chan bool)
-	s.stopped <- stop
-	s.state = Stopped
+	if s.State() == Stopped {
+		return
+	}
 
-	// make sure the server has stopped before we close the log
-	<-stop
+	close(s.stopped)
+
+	// make sure all goroutines have stopped before we close the log
+	s.routineGroup.Wait()
+
 	s.log.close()
+	s.setState(Stopped)
 }
 
 // Checks if the server is currently running.
@@ -527,8 +546,6 @@ func (s *server) updateCurrentTerm(term uint64, leaderName string) {
 	_assert(term > s.currentTerm,
 		"upadteCurrentTerm: update is called when term is not larger than currentTerm")
 
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
 	// Store previous values temporarily.
 	prevTerm := s.currentTerm
 	prevLeader := s.leader
@@ -536,21 +553,20 @@ func (s *server) updateCurrentTerm(term uint64, leaderName string) {
 	// set currentTerm = T, convert to follower (§5.1)
 	// stop heartbeats before step-down
 	if s.state == Leader {
-		s.mutex.Unlock()
 		for _, peer := range s.peers {
 			peer.stopHeartbeat(false)
 		}
-		s.mutex.Lock()
 	}
 	// update the term and clear vote for
 	if s.state != Follower {
-		s.mutex.Unlock()
 		s.setState(Follower)
-		s.mutex.Lock()
 	}
+
+	s.mutex.Lock()
 	s.currentTerm = term
 	s.leader = leaderName
 	s.votedFor = ""
+	s.mutex.Unlock()
 
 	// Dispatch change events.
 	s.DispatchEvent(newEvent(TermChangeEventType, s.currentTerm, prevTerm))
@@ -580,9 +596,9 @@ func (s *server) updateCurrentTerm(term uint64, leaderName string) {
 func (s *server) loop() {
 	defer s.debugln("server.loop.end")
 
-	for s.state != Stopped {
-		state := s.State()
+	state := s.State()
 
+	for state != Stopped {
 		s.debugln("server.loop.run ", state)
 		switch state {
 		case Follower:
@@ -594,19 +610,36 @@ func (s *server) loop() {
 		case Snapshotting:
 			s.snapshotLoop()
 		}
+		state = s.State()
 	}
 }
 
 // Sends an event to the event loop to be processed. The function will wait
 // until the event is actually processed before returning.
 func (s *server) send(value interface{}) (interface{}, error) {
+	if !s.Running() {
+		return nil, StopError
+	}
+
 	event := &ev{target: value, c: make(chan error, 1)}
-	s.c <- event
-	err := <-event.c
-	return event.returnValue, err
+	select {
+	case s.c <- event:
+	case <-s.stopped:
+		return nil, StopError
+	}
+	select {
+	case <-s.stopped:
+		return nil, StopError
+	case err := <-event.c:
+		return event.returnValue, err
+	}
 }
 
 func (s *server) sendAsync(value interface{}) {
+	if !s.Running() {
+		return
+	}
+
 	event := &ev{target: value, c: make(chan error, 1)}
 	// try a non-blocking send first
 	// in most cases, this should not be blocking
@@ -617,8 +650,13 @@ func (s *server) sendAsync(value interface{}) {
 	default:
 	}
 
+	s.routineGroup.Add(1)
 	go func() {
-		s.c <- event
+		defer s.routineGroup.Done()
+		select {
+		case s.c <- event:
+		case <-s.stopped:
+		}
 	}()
 }
 
@@ -636,9 +674,8 @@ func (s *server) followerLoop() {
 		var err error
 		update := false
 		select {
-		case stop := <-s.stopped:
+		case <-s.stopped:
 			s.setState(Stopped)
-			stop <- true
 			return
 
 		case e := <-s.c:
@@ -713,7 +750,11 @@ func (s *server) candidateLoop() {
 			// Send RequestVote RPCs to all other servers.
 			respChan = make(chan *RequestVoteResponse, len(s.peers))
 			for _, peer := range s.peers {
-				go peer.sendVoteRequest(newRequestVoteRequest(s.currentTerm, s.name, lastLogIndex, lastLogTerm), respChan)
+				s.routineGroup.Add(1)
+				go func(peer *Peer) {
+					defer s.routineGroup.Done()
+					peer.sendVoteRequest(newRequestVoteRequest(s.currentTerm, s.name, lastLogIndex, lastLogTerm), respChan)
+				}(peer)
 			}
 
 			// Wait for either:
@@ -736,9 +777,8 @@ func (s *server) candidateLoop() {
 
 		// Collect votes from peers.
 		select {
-		case stop := <-s.stopped:
+		case <-s.stopped:
 			s.setState(Stopped)
-			stop <- true
 			return
 
 		case resp := <-respChan:
@@ -782,19 +822,22 @@ func (s *server) leaderLoop() {
 	// "Upon election: send initial empty AppendEntries RPCs (heartbeat) to
 	// each server; repeat during idle periods to prevent election timeouts
 	// (§5.2)". The heartbeats started above do the "idle" period work.
-	go s.Do(NOPCommand{})
+	s.routineGroup.Add(1)
+	go func() {
+		defer s.routineGroup.Done()
+		s.Do(NOPCommand{})
+	}()
 
 	// Begin to collect response from followers
 	for s.State() == Leader {
 		var err error
 		select {
-		case stop := <-s.stopped:
+		case <-s.stopped:
 			// Stop all peers before stop
 			for _, peer := range s.peers {
 				peer.stopHeartbeat(false)
 			}
 			s.setState(Stopped)
-			stop <- true
 			return
 
 		case e := <-s.c:
@@ -822,9 +865,8 @@ func (s *server) snapshotLoop() {
 	for s.State() == Snapshotting {
 		var err error
 		select {
-		case stop := <-s.stopped:
+		case <-s.stopped:
 			s.setState(Stopped)
-			stop <- true
 			return
 
 		case e := <-s.c:
@@ -903,9 +945,14 @@ func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*Append
 	}
 
 	if req.Term == s.currentTerm {
-		_assert(s.state != Leader, "leader.elected.at.same.term.%d\n", s.currentTerm)
-		// change state to follower
-		s.state = Follower
+		_assert(s.State() != Leader, "leader.elected.at.same.term.%d\n", s.currentTerm)
+
+		// step-down to follower when it is a candidate
+		if s.state == Candidate {
+			// change state to follower
+			s.setState(Follower)
+		}
+
 		// discover new leader when candidate
 		// save leader name when follower
 		s.leader = req.LeaderName
@@ -1105,7 +1152,11 @@ func (s *server) RemovePeer(name string) error {
 			// So we might be holding log lock and waiting for log lock,
 			// which lead to a deadlock.
 			// TODO(xiangli) refactor log lock
-			go peer.stopHeartbeat(true)
+			s.routineGroup.Add(1)
+			go func() {
+				defer s.routineGroup.Done()
+				peer.stopHeartbeat(true)
+			}()
 		}
 
 		delete(s.peers, name)

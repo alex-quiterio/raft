@@ -3,6 +3,13 @@ go-raft [![Build Status](https://drone.io/github.com/goraft/raft/status.png)](ht
 
 ## Overview
 
+![unmaintained](http://img.shields.io/badge/status-unmaintained-red.png)
+
+**NOTE**: This project is unmaintained. If you are using goraft in a project
+and want to carry the project forward please file an issue with your ideas and
+intentions. The original project authors have created new raft implementations
+now used in etcd and InfluxDB.
+
 This is a Go implementation of the Raft distributed consensus protocol.
 Raft is a protocol by which a cluster of nodes can maintain a replicated state machine.
 The state machine is kept in sync through the use of a replicated log.
@@ -32,11 +39,12 @@ go-raft is under the MIT license.
 
 These projects are built on go-raft:
 
-- [coreos/etcd](https://github.com/coreos/etcd) - A highly-available key value store for shared configuration and service discovery.
+- [coreos/etcd 0.4.* and older](https://github.com/coreos/etcd) - A highly-available key value store for shared configuration and service discovery. Note: etcd from v2.0.0 onward has since started using a [new raft implementation](godoc.org/github.com/coreos/etcd/raft).
 - [goraft/raftd](https://github.com/goraft/raftd) - A reference implementation for using the go-raft library for distributed consensus.
 - [skynetservices/skydns](https://github.com/skynetservices/skydns) - DNS for skynet or any other service discovery.
 - [influxdb/influxdb](https://github.com/influxdb/influxdb) - An open-source, distributed, time series, events, and metrics database.
 - [Weed File System](https://weed-fs.googlecode.com) - A scalable distributed key-to-file system with O(1) disk access for each read.
+- [rqlite](https://github.com/otoolep/rqlite) - A replicated SQLite database, distributing the database replicas across multiple nodes.
 
 If you have a project that you're using go-raft in, please add it to this README so others can see implementation examples.
 
@@ -135,4 +143,4 @@ If you have a very large cluster that you need to replicate to using Option 1 th
 Ben Johnson started this library for use in his behavioral analytics database called [Sky](https://github.com/skydb/sky).
 He put it under the MIT license in the hopes that it would be useful for other projects too.
 
-[raft-paper]: https://ramcloud.stanford.edu/wiki/download/attachments/11370504/raft.pdf
+[raft-paper]: https://ramcloud.stanford.edu/raft.pdf
